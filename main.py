@@ -7,6 +7,9 @@ import pandas as pd
 from pathlib import Path
 import serial
 import serial.tools.list_ports
+import minimalmodbus
+import time
+import struct
 
 class SerialPortDialog(QDialog):
     """시리얼 포트 선택을 위한 다이얼로그"""
@@ -111,6 +114,61 @@ class SaveNumberDialog(QDialog):
         """선택된 번호 반환"""
         return self.number_combo.currentData()
 
+class ModbusController:
+    """Modbus RTU 통신을 위한 컨트롤러 클래스"""
+    def __init__(self, port, slave_address=1):
+        self.instrument = minimalmodbus.Instrument(port, slave_address)
+        self.instrument.serial.baudrate = 115200
+        self.instrument.serial.timeout = 1.0
+        self.instrument.mode = minimalmodbus.MODE_RTU
+        self.instrument.clear_buffers_before_each_transaction = True
+
+    def write_pattern_data(self, save_location, pattern_data):
+        """패턴 데이터를 보드에 저장"""
+        try:
+            # 저장 위치 설정 (레지스터 주소 0x0 사용)
+            self.instrument.write_register(0x0, save_location)
+            time.sleep(0.1)  # 안정화를 위한 대기
+
+            # 데이터 개수 전송 (레지스터 주소 0x1 사용)
+            num_rows = len(pattern_data)
+            self.instrument.write_register(0x1, num_rows)
+            time.sleep(0.1)
+
+            # 패턴 데이터 전송 (레지스터 주소 0x2부터 시작)
+            base_address = 0x2
+            for row_idx, row in enumerate(pattern_data):
+                for col_idx, value in enumerate(row):
+                    # 각 채널 값을 16비트 정수로 변환하여 전송
+                    register_address = base_address + (row_idx * len(row)) + col_idx
+                    self.instrument.write_register(register_address, int(value))
+                    time.sleep(0.01)  # 안정화를 위한 대기
+            if save_location == 0:
+                self.instrument.write_register(1000, 1, functioncode=0x06)       # 패턴 실행
+            return True
+        except Exception as e:
+            raise Exception(f"데이터 전송 중 오류 발생: {str(e)}")
+
+    def start_pattern(self, pattern_number):
+        """패턴 실행 시작"""
+        try:
+            # 실행할 패턴 번호 설정 (레지스터 주소 0x2000 사용)
+            self.instrument.write_register(0x2000, pattern_number)
+            # 실행 명령 전송 (레지스터 주소 0x2001 사용, 값 1은 실행)
+            self.instrument.write_register(0x2001, 1)
+            return True
+        except Exception as e:
+            raise Exception(f"패턴 실행 중 오류 발생: {str(e)}")
+
+    def stop_pattern(self):
+        """패턴 실행 정지"""
+        try:
+            # 정지 명령 전송 (레지스터 주소 0x2001 사용, 값 0은 정지)
+            self.instrument.write_register(0x2001, 0)
+            return True
+        except Exception as e:
+            raise Exception(f"패턴 정지 중 오류 발생: {str(e)}")
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -121,17 +179,22 @@ class MainWindow(QMainWindow):
         main_widget = QWidget()
         self.setCentralWidget(main_widget)
         main_layout = QHBoxLayout(main_widget)
+        main_layout.setSpacing(4)  # 기본값 6의 80%
 
         # 테이블 뷰 영역 (왼쪽에 위치, 가장 큰 공간 차지)
         center_widget = QWidget()
         center_layout = QVBoxLayout(center_widget)
+        center_layout.setSpacing(4)  # 기본값 6의 80%
         
         self.table_view = QTableView()
         self.table_view.setSelectionBehavior(QTableView.SelectRows)
         self.table_view.setSelectionMode(QTableView.SingleSelection)
+        self.table_view.verticalHeader().setDefaultSectionSize(20)  # 기본값 25의 80%
         
         # 컬럼 너비 설정 (이전 값의 90%로 추가 감소)
         self.table_view.horizontalHeader().setDefaultSectionSize(65)  # 72 * 0.9 = 65
+        # 컬럼 헤더 높이 설정 (20% 감소)
+        self.table_view.horizontalHeader().setFixedHeight(20)  # 기본값 25의 80%
         
         center_layout.addWidget(self.table_view)
         
@@ -140,6 +203,7 @@ class MainWindow(QMainWindow):
         # 오른쪽 영역 (상태 표시 + 버튼)
         right_widget = QWidget()
         right_layout = QVBoxLayout(right_widget)
+        right_layout.setSpacing(4)  # 기본값 6의 80%
         
         # 상태 표시 영역
         self.status_text = QTextEdit()
@@ -150,6 +214,7 @@ class MainWindow(QMainWindow):
         # 버튼 영역
         button_widget = QWidget()
         button_layout = QGridLayout(button_widget)
+        button_layout.setSpacing(4)  # 기본값 6의 80%
         
         self.add_button = QPushButton("행 추가")
         self.select_button = QPushButton("파일 선택")
@@ -209,6 +274,7 @@ class MainWindow(QMainWindow):
 
         # 시리얼 통신 관련 변수 초기화
         self.serial_port = None
+        self.modbus_controller = None  # Modbus 컨트롤러 초기화
 
     def update_status(self, message):
         """상태 메시지를 업데이트하는 메서드"""
@@ -287,7 +353,7 @@ class MainWindow(QMainWindow):
         button_text = self.connect_board_button.text()
         if button_text == "보드연결":
             dialog = SerialPortDialog(self)
-            if dialog.exec_():
+            if dialog.exec():
                 selected_port = dialog.get_selected_port()
                 if selected_port:
                     try:
@@ -296,21 +362,22 @@ class MainWindow(QMainWindow):
                             self.serial_port.close()
                             self.update_status("이전 연결이 종료되었습니다.")
                         
-                        # 새로운 시리얼 포트 연결
-                        self.serial_port = serial.Serial(
-                            port=selected_port,
-                            baudrate=115200,  # 보드의 통신 속도에 맞게 설정
-                            timeout=1
-                        )
+                        # Modbus 컨트롤러 초기화
+                        self.modbus_controller = ModbusController(selected_port)
+                        self.serial_port = self.modbus_controller.instrument.serial
+                        
                         self.update_status(f"보드가 연결되었습니다: {selected_port}")
                         self.connect_board_button.setText("연결 해제")
-                    except serial.SerialException as e:
+                    except Exception as e:
                         self.update_status(f"연결 오류: {str(e)}")
                         self.serial_port = None
+                        self.modbus_controller = None
                 else:
                     self.update_status("포트가 선택되지 않았습니다.")
         else:
-            self.serial_port.close()
+            if self.serial_port:
+                self.serial_port.close()
+            self.modbus_controller = None
             self.connect_board_button.setText("보드연결")
             self.update_status(f"보드 연결이 해제되었습니다")
 
@@ -345,62 +412,63 @@ class MainWindow(QMainWindow):
 
     def save_to_board(self):
         """보드에 데이터 저장"""
-        if not self.serial_port or not self.serial_port.is_open:
+        if not self.modbus_controller:
             self.update_status("보드가 연결되어 있지 않습니다.")
             return
             
         dialog = SaveNumberDialog(self)
-        if dialog.exec_():
+        if dialog.exec():
             selected_number = dialog.get_selected_number()
             try:
-                # 현재 데이터를 파일에 저장
-                self.save_data()
+                # 현재 데이터를 현재 파일에 저장
+                data_to_save = self.df.copy()
+                data_to_save = data_to_save.replace('', '0')
+                data_to_save.to_csv(self.current_file, index=False, header=False)
+                self.update_status(f"현재 데이터가 파일에 저장되었습니다: {self.current_file}")
                 
-                # 데이터프레임의 각 행을 튜플로 변환하여 리스트 생성
-                data_list = [(selected_number,)]  # 첫 번째 튜플에 저장 위치 번호 저장
-                
+                # 데이터프레임을 리스트로 변환
+                data_list = []
                 for index, row in self.df.iterrows():
                     # 빈 문자열을 0으로 변환하고 모든 값을 int로 변환
                     row_data = [int(val) if val != '' else 0 for val in row.values]
-                    data_list.append(tuple(row_data))
+                    data_list.append(row_data)
                 
                 self.update_status(f"저장 위치 {selected_number}번에 데이터를 저장합니다.")
-                self.update_status(f"총 {len(data_list)-1}개의 행이 처리되었습니다.")
-                self.update_status(f"첫 번째 데이터: {data_list[0]}")
-                self.update_status(f"두 번째 데이터: {data_list[1] if len(data_list) > 1 else '없음'}")
+                self.update_status(f"총 {len(data_list)}개의 행이 처리되었습니다.")
                 
-                # 여기에 실제 보드 저장 로직 구현
-                # 예시: self.send_uart_data(f"SAVE,{len(data_list)}")
-                # 예시: for data in data_list:
-                #          self.send_uart_data(','.join(map(str, data)))
+                # Modbus를 통해 데이터 전송
+                if self.modbus_controller.write_pattern_data(selected_number, data_list):
+                    self.update_status("데이터가 성공적으로 저장되었습니다.")
                 
             except Exception as e:
                 self.update_status(f"보드 저장 중 오류 발생: {str(e)}")
 
     def run_board(self):
         """보드 구동"""
-        if not self.serial_port or not self.serial_port.is_open:
+        if not self.modbus_controller:
             self.update_status("보드가 연결되어 있지 않습니다.")
             return
             
         try:
-            # 현재 데이터를 파일에 저장
-            self.save_data()
+            # 현재 데이터를 현재 파일에 저장
+            data_to_save = self.df.copy()
+            data_to_save = data_to_save.replace('', '0')
+            data_to_save.to_csv(self.current_file, index=False, header=False)
+            self.update_status(f"현재 데이터가 파일에 저장되었습니다: {self.current_file}")
             
-            # 데이터프레임의 각 행을 튜플로 변환하여 리스트 생성
+            # 데이터프레임을 리스트로 변환
             data_list = []
             for index, row in self.df.iterrows():
-                # 빈 문자열을 0으로 변환하고 모든 값을 float로 변환
+                # 빈 문자열을 0으로 변환하고 모든 값을 int로 변환
                 row_data = [int(val) if val != '' else 0 for val in row.values]
-                data_list.append(tuple(row_data))
+                data_list.append(row_data)
             
+            self.update_status("패턴 데이터를 전송합니다.")
             self.update_status(f"총 {len(data_list)}개의 행이 처리되었습니다.")
-            self.update_status(f"첫 번째 행 데이터: {data_list[0] if data_list else '없음'}")
             
-            # 여기에 실제 보드 구동 로직 구현
-            # 예시: self.send_uart_data(f"RUN,{len(data_list)}")
-            # 예시: for data in data_list:
-            #          self.send_uart_data(','.join(map(str, data)))
+            # Modbus를 통해 데이터 전송 (위치 0 고정)
+            if self.modbus_controller.write_pattern_data(0, data_list):
+                self.update_status("데이터가 성공적으로 전송되었습니다.")
             
         except Exception as e:
             self.update_status(f"보드 구동 중 오류 발생: {str(e)}")
